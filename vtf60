@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# vtf60 — segmented 60 fps conversion with Apple VTFrameProcessor.
+#
+# interp-harness (wasim-osman/60FPSVideo) never releases about 1.2 MB of memory
+# per output frame. A single process dies around 72k-74k output frames, so long
+# inputs are cut into short segments and each segment runs in its own process.
+# See README.md for the measurements.
+#
+# usage: vtf60 <input> <output> [ignored extra args]
+set -uo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: vtf60 <input> <output> [ignored extra args]" >&2
+  exit 2
+fi
+
+IN="$1"; OUT="$2"; shift 2 || true
+
+HARNESS="${VTF_HARNESS:-interp-harness}"
+POLICY="${VTF_POLICY:-sixty}"
+SEG="${VTF_SEGMENT_SECONDS:-60}"
+PAR="${VTF_PARALLEL:-1}"          # keep at 1: workers=4 already peaks near 10 GB
+WORKERS="${VTF_WORKERS:-4}"
+ACT=""
+[ "${VTF_ACTIVITY:-0}" = "1" ] && ACT="--activity"
+
+TMP="${VTF_TMPDIR:-${TMPDIR:-/tmp}/vtf60_$(basename "$OUT" .mkv)}"
+mkdir -p "$TMP"
+
+# Segments are kept on failure so a rerun can resume. Set VTF_KEEP_TMP=1 to
+# keep them on success too.
+trap '[ "${VTF_DONE:-0}" = "1" ] || echo "[vtf60] interrupted — segments kept: $TMP"' EXIT
+
+DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$IN" | cut -d. -f1)
+FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nw=1:nk=1 "$IN")
+N=$(( (DUR + SEG - 1) / SEG ))
+echo "[vtf60] start $(date '+%H:%M:%S') dur=${DUR}s fps=$FPS seg=${SEG}s par=$PAR n=$N"
+
+run_seg() {
+  local idx=$1 start=$2 frames=$3 out="$TMP/seg_$(printf '%03d' "$1").mkv"
+  # Resume: reuse a segment that already decodes and reports a duration.
+  if [ -f "$out" ] && ffprobe -v error -show_entries format=duration \
+       -of default=nw=1:nk=1 "$out" 2>/dev/null | grep -q '^[0-9]'; then
+    echo "[vtf60] seg $idx reused" >> "$TMP/harness_$idx.log"
+    return 0
+  fi
+  VTF_FORCE_P010=1 "$HARNESS" --convert "$IN" "$out" --policy "$POLICY" \
+    --start "$start" --max-frames "$frames" --workers "$WORKERS" $ACT --overwrite \
+    >> "$TMP/harness_$idx.log" 2>&1
+}
+
+i=0
+while [ $i -lt $N ]; do
+  pids=""
+  j=0
+  while [ $j -lt $PAR ] && [ $i -lt $N ]; do
+    start=$(( i * SEG )); len=$(( (DUR - start < SEG) ? DUR - start : SEG ))
+    frames=$(python3 -c "import sys;fr=sys.argv[1].split('/');print(int(round(float(fr[0])/float(fr[1])*int(sys.argv[2]))))" "$FPS" "$len")
+    # One extra source frame: the harness emits ceil(2.5*(N-1)) frames, two short
+    # of the nominal count. Requesting N+1 fills the segment exactly.
+    frames=$(( frames + 1 ))
+    echo "[vtf60] seg $i start=${start}s frames=$frames $(date '+%H:%M:%S')"
+    run_seg "$i" "$start" "$frames" &
+    pids="$pids $!"
+    i=$(( i + 1 )); j=$(( j + 1 ))
+  done
+  fail=0
+  for p in $pids; do wait "$p" || fail=1; done
+  if [ $fail -ne 0 ]; then echo "[vtf60] segment batch failed"; exit 1; fi
+done
+
+LIST="$TMP/list.txt"; : > "$LIST"
+k=0
+while [ $k -lt $N ]; do
+  segstart=$(( k * SEG )); seglen=$(( (DUR - segstart < SEG) ? DUR - segstart : SEG ))
+  segpath="$TMP/seg_$(printf '%03d' "$k").mkv"
+  # ffmpeg's concat parser uses shell-like quoting for the file name.
+  escpath=${segpath//\'/\'\\\'\'}
+  echo "file '$escpath'" >> "$LIST"
+  # Without an explicit duration the container length of each segment becomes
+  # the offset, which re-opens the boundary gap.
+  echo "duration $seglen.000" >> "$LIST"
+  k=$(( k + 1 ))
+done
+
+echo "[vtf60] concat $(date '+%H:%M:%S')"
+ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$LIST" -c copy "$TMP/video.mkv" || exit 1
+
+echo "[vtf60] remux $(date '+%H:%M:%S')"
+ffmpeg -hide_banner -loglevel error -y -i "$TMP/video.mkv" -i "$IN" \
+  -map 0:v:0 -map 1:a? -map 1:s? -map 1:t? -map_chapters 1 \
+  -c copy "$OUT" || exit 1
+
+VTF_DONE=1
+echo "[vtf60] done $(date '+%H:%M:%S')"
+[ "${VTF_KEEP_TMP:-0}" != "1" ] && rm -rf "$TMP"

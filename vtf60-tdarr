@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# vtf60-tdarr — wrapper for a Tdarr flow plugin.
+#
+# Contract used by the plugin: vtf60-tdarr <input> <output> [ignored args]
+# Produces <output> and exits 0. After conversion it measures the A/V drift and
+# corrects it losslessly with the setts bitstream filter when it exceeds 0.1 s.
+#
+# Environment:
+#   VTF60          path to the vtf60 script (default: next to this file)
+#   VTF_SEGMENT_SECONDS, VTF_WORKERS   forwarded to vtf60
+#   VTF_DRIFT_LIMIT  seconds before correction kicks in (default 0.1)
+set -uo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: vtf60-tdarr <input> <output> [ignored args]" >&2
+  exit 2
+fi
+
+IN="$1"; OUT="$2"; shift 2 || true
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+VTF60="${VTF60:-$SELF_DIR/vtf60}"
+LIMIT="${VTF_DRIFT_LIMIT:-0.1}"
+
+export VTF_SEGMENT_SECONDS="${VTF_SEGMENT_SECONDS:-60}"
+export VTF_WORKERS="${VTF_WORKERS:-4}"
+
+"$VTF60" "$IN" "$OUT" || exit $?
+[ -f "$OUT" ] || exit 1
+
+# Container length (audio/subtitle timeline) minus the last video packet.
+A=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT")
+V=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$OUT" 2>/dev/null | tail -1)
+[ -z "$A" ] && exit 0
+[ -z "$V" ] && exit 0
+
+DRIFT=$(awk "BEGIN{printf \"%.4f\", $A-$V}")
+echo "[vtf60-tdarr] drift=${DRIFT}s (container=$A last_video_pts=$V)"
+
+if awk "BEGIN{exit !($DRIFT > $LIMIT)}"; then
+  SC=$(awk "BEGIN{printf \"%.8f\", $A/$V}")
+  echo "[vtf60-tdarr] correcting drift, scale=$SC"
+  FIXED="$OUT.ptsfix.mkv"
+  if ffmpeg -hide_banner -loglevel error -y -i "$OUT" -map 0 -c copy -map_chapters 0 \
+       -bsf:v "setts=pts=PTS*$SC:dts=DTS*$SC" "$FIXED"; then
+    mv "$FIXED" "$OUT"
+    echo "[vtf60-tdarr] drift corrected"
+  else
+    echo "[vtf60-tdarr] correction failed, original kept"
+    rm -f "$FIXED"
+  fi
+fi
+
+exit 0
