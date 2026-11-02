@@ -31,9 +31,9 @@ mkdir -p "$TMP"
 # keep them on success too.
 trap '[ "${VTF_DONE:-0}" = "1" ] || echo "[vtf60] interrupted — segments kept: $TMP"' EXIT
 
-DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$IN" | cut -d. -f1)
+DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$IN" | awk '{printf "%.3f", $1}')
 FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nw=1:nk=1 "$IN")
-N=$(( (DUR + SEG - 1) / SEG ))
+N=$(awk -v d="$DUR" -v s="$SEG" 'BEGIN{n=int(d/s); if (d-n*s > 0.001) n++; print n}')
 echo "[vtf60] start $(date '+%H:%M:%S') dur=${DUR}s fps=$FPS seg=${SEG}s par=$PAR n=$N"
 
 run_seg() {
@@ -54,7 +54,7 @@ while [ $i -lt $N ]; do
   pids=""
   j=0
   while [ $j -lt $PAR ] && [ $i -lt $N ]; do
-    start=$(( i * SEG )); len=$(( (DUR - start < SEG) ? DUR - start : SEG ))
+    start=$(( i * SEG )); len=$(awk -v d="$DUR" -v st="$start" -v s="$SEG" 'BEGIN{l=d-st; if (l>s) l=s; printf "%.3f", l}')
     frames=$(python3 -c "import sys;fr=sys.argv[1].split('/');print(int(round(float(fr[0])/float(fr[1])*int(sys.argv[2]))))" "$FPS" "$len")
     # One extra source frame: the harness emits ceil(2.5*(N-1)) frames, two short
     # of the nominal count. Requesting N+1 fills the segment exactly.
@@ -72,14 +72,14 @@ done
 LIST="$TMP/list.txt"; : > "$LIST"
 k=0
 while [ $k -lt $N ]; do
-  segstart=$(( k * SEG )); seglen=$(( (DUR - segstart < SEG) ? DUR - segstart : SEG ))
+  segstart=$(( k * SEG )); seglen=$(awk -v d="$DUR" -v st="$segstart" -v s="$SEG" 'BEGIN{l=d-st; if (l>s) l=s; printf "%.3f", l}')
   segpath="$TMP/seg_$(printf '%03d' "$k").mkv"
   # ffmpeg's concat parser uses shell-like quoting for the file name.
   escpath=${segpath//\'/\'\\\'\'}
   echo "file '$escpath'" >> "$LIST"
   # Without an explicit duration the container length of each segment becomes
   # the offset, which re-opens the boundary gap.
-  echo "duration $seglen.000" >> "$LIST"
+  echo "duration $seglen" >> "$LIST"
   k=$(( k + 1 ))
 done
 
