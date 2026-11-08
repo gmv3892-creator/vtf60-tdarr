@@ -17,7 +17,7 @@ fi
 IN="$1"; OUT="$2"; shift 2 || true
 
 HARNESS="${VTF_HARNESS:-interp-harness}"
-POLICY="${VTF_POLICY:-sixty}"
+POLICY="${VTF_POLICY:-standard}"
 SEG="${VTF_SEGMENT_SECONDS:-60}"
 PAR="${VTF_PARALLEL:-1}"          # keep at 1: workers=4 already peaks near 10 GB
 WORKERS="${VTF_WORKERS:-4}"
@@ -55,7 +55,7 @@ while [ $i -lt $N ]; do
   j=0
   while [ $j -lt $PAR ] && [ $i -lt $N ]; do
     start=$(( i * SEG )); len=$(awk -v d="$DUR" -v st="$start" -v s="$SEG" 'BEGIN{l=d-st; if (l>s) l=s; printf "%.3f", l}')
-    frames=$(python3 -c "import sys;fr=sys.argv[1].split('/');print(int(round(float(fr[0])/float(fr[1])*int(sys.argv[2]))))" "$FPS" "$len")
+    frames=$(python3 -c "import sys;fr=sys.argv[1].split('/');print(int(round(float(fr[0])/float(fr[1])*float(sys.argv[2]))))" "$FPS" "$len")
     # One extra source frame: the harness emits ceil(2.5*(N-1)) frames, two short
     # of the nominal count. Requesting N+1 fills the segment exactly.
     frames=$(( frames + 1 ))
